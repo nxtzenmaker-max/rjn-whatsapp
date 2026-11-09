@@ -42,6 +42,9 @@ let pairingPhone = DEFAULT_PHONE;
 let rateLimitDetected = false;
 let rateLimitMessage = '';
 
+const contactsMap = new Map();
+const chatsMap = new Map();
+
 // ================= MONGODB SESSION STORAGE =================
 async function initMongo() {
   try {
@@ -50,6 +53,7 @@ async function initMongo() {
     db = mongoClient.db('rjn_holo');
     console.log('Connected to MongoDB Atlas: rjn_holo');
     await restoreAuthFromMongo();
+    await loadInitialContactsFromMongo();
   } catch (err) {
     console.error('MongoDB connection error:', err.message);
   }
@@ -60,7 +64,7 @@ async function restoreAuthFromMongo() {
   try {
     const authCol = db.collection('whatsapp_auth');
     const docs = await authCol.find({}).toArray();
-    if (docs && docs.length > 1) { // Verified session has multiple key files
+    if (docs && docs.length > 1) {
       console.log(`Restoring ${docs.length} verified session files from MongoDB Atlas...`);
       for (const doc of docs) {
         if (doc.filename && doc.content) {
@@ -73,6 +77,15 @@ async function restoreAuthFromMongo() {
   } catch (e) {
     console.warn('Error restoring auth from MongoDB:', e.message);
   }
+}
+
+async function loadInitialContactsFromMongo() {
+  if (!db) return;
+  try {
+    const docs = await db.collection('whatsapp_contacts').find({}).toArray();
+    docs.forEach(c => contactsMap.set(c._id, c));
+    console.log(`Loaded ${contactsMap.size} cached contacts from MongoDB.`);
+  } catch(e){}
 }
 
 async function syncAuthToMongo() {
@@ -115,6 +128,33 @@ async function executeCloudCommand(command) {
   }
 }
 
+// ================= SAVE CONTACT HELPER =================
+async function saveContact(c) {
+  if (!c || !c.id || c.id.includes('@broadcast') || c.id.includes('status')) return;
+  const phone = c.id.split('@')[0];
+  const name = c.name || c.notify || c.verifiedName || '';
+  const contactData = {
+    _id: c.id,
+    id: c.id,
+    phone,
+    name,
+    notify: c.notify || '',
+    verifiedName: c.verifiedName || '',
+    updatedAt: new Date()
+  };
+  contactsMap.set(c.id, contactData);
+
+  if (db) {
+    try {
+      await db.collection('whatsapp_contacts').updateOne(
+        { _id: c.id },
+        { $set: contactData },
+        { upsert: true }
+      );
+    } catch(e){}
+  }
+}
+
 // ================= BAILEYS SOCKET CLIENT =================
 async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
   pairingPhone = requestedPhone.replace(/[^0-9]/g, '');
@@ -133,7 +173,7 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
         keys: makeCacheableSignalKeyStore(state.keys, logger)
       },
       browser: Browsers.ubuntu('Chrome'),
-      syncFullHistory: false
+      syncFullHistory: true
     });
 
     sock.ev.on('creds.update', async () => {
@@ -187,10 +227,63 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
           if (db) await db.collection('whatsapp_auth').deleteMany({});
           setTimeout(() => startWhatsApp(DEFAULT_PHONE), 5000);
         } else if (!activeUser) {
-          // Keep a healthy 10-second gap before reconnecting so we never trigger WhatsApp rate limits
           setTimeout(() => startWhatsApp(pairingPhone), 10000);
         } else {
           setTimeout(() => startWhatsApp(pairingPhone), 3000);
+        }
+      }
+    });
+
+    // ================= CONTACTS & CHAT HISTORY EVENTS =================
+    sock.ev.on('contacts.upsert', async (contacts) => {
+      console.log(`Received contacts.upsert: ${contacts.length} contacts`);
+      for (const c of contacts) {
+        await saveContact(c);
+      }
+    });
+
+    sock.ev.on('contacts.update', async (updates) => {
+      for (const u of updates) {
+        await saveContact(u);
+      }
+    });
+
+    sock.ev.on('chats.upsert', async (chats) => {
+      for (const ch of chats) {
+        if (!ch.id || ch.id.includes('@broadcast')) continue;
+        chatsMap.set(ch.id, ch);
+        if (db) {
+          try {
+            await db.collection('whatsapp_chats').updateOne(
+              { _id: ch.id },
+              { $set: { ...ch, updatedAt: new Date() } },
+              { upsert: true }
+            );
+          } catch(e){}
+        }
+      }
+    });
+
+    sock.ev.on('messaging-history.set', async ({ chats, contacts, messages }) => {
+      console.log(`History sync received: ${contacts?.length || 0} contacts, ${chats?.length || 0} chats, ${messages?.length || 0} messages`);
+      if (contacts && Array.isArray(contacts)) {
+        for (const c of contacts) {
+          await saveContact(c);
+        }
+      }
+      if (chats && Array.isArray(chats)) {
+        for (const ch of chats) {
+          if (!ch.id || ch.id.includes('@broadcast')) continue;
+          chatsMap.set(ch.id, ch);
+          if (db) {
+            try {
+              await db.collection('whatsapp_chats').updateOne(
+                { _id: ch.id },
+                { $set: { ...ch, updatedAt: new Date() } },
+                { upsert: true }
+              );
+            } catch(e){}
+          }
         }
       }
     });
@@ -203,6 +296,11 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
         if (!msg.message || msg.key.fromMe) continue;
         const remoteJid = msg.key.remoteJid;
         if (remoteJid.endsWith('@broadcast') || remoteJid.includes('status')) continue;
+
+        // Auto-save sender contact if notify name present
+        if (msg.pushName) {
+          await saveContact({ id: remoteJid, notify: msg.pushName });
+        }
 
         const text = msg.message.conversation ||
                      msg.message.extendedTextMessage?.text ||
@@ -263,27 +361,58 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
           continue;
         }
 
-        // 2. Database Stats
+        // 2. Contacts Query on WhatsApp
+        if (lower.includes('contact') || lower.includes('contacts') || lower.includes('kis kis ke number') || lower.includes('kaun kaun se contact')) {
+          let list = [];
+          if (db) {
+            try {
+              list = await db.collection('whatsapp_contacts').find({}).sort({ name: 1 }).limit(30).toArray();
+            } catch(e){}
+          }
+          if (list.length === 0) {
+            list = Array.from(contactsMap.values()).slice(0, 30);
+          }
+
+          let contactReply = `📱 RJN WhatsApp Contacts Directory (${list.length} contacts):\n\n`;
+          if (list.length === 0) {
+            contactReply += 'Phone ke contacts sync ho rahe hain. Thodi der me dobara check karein!';
+          } else {
+            list.slice(0, 15).forEach((c, idx) => {
+              const name = c.name || c.notify || 'Contact';
+              const p = c.phone || c.id?.split('@')[0] || '';
+              contactReply += `${idx + 1}. ${name} (+${p})\n`;
+            });
+            if (list.length > 15) {
+              contactReply += `\n...aur ${list.length - 15} contacts hain. Dashboard par poori directory dekhein: ${RUNNER_URL.replace('rjn-runner', 'rjn-whatsapp')}`;
+            }
+          }
+          await sock.sendMessage(remoteJid, { text: contactReply });
+          continue;
+        }
+
+        // 3. Database Stats
         if (lower.includes('database') || lower.includes('db status') || lower.includes('stats')) {
           let count = 0;
           let turns = 0;
+          let contactsCount = contactsMap.size;
           if (db) {
             count = await db.collection('whatsapp_messages').countDocuments({});
             turns = await db.collection('conversations').countDocuments({});
+            contactsCount = await db.collection('whatsapp_contacts').countDocuments({});
           }
-          const dbReply = `📊 RJN Database Access Active (MongoDB Atlas):\n• Database: rjn_holo\n• WhatsApp Messages: ${count}\n• Web Hologram Speech Turns: ${turns}\n• Cloud Runner: Online (${RUNNER_URL})\n\nमैं RJN हूँ! आप मुझे कोई भी command चलाने को कह सकते हैं।`;
+          const dbReply = `📊 RJN Database Access Active (MongoDB Atlas):\n• Database: rjn_holo\n• Contacts Synced: ${contactsCount}\n• WhatsApp Messages: ${count}\n• Web Hologram Speech Turns: ${turns}\n• Cloud Runner: Online (${RUNNER_URL})\n\nमैं RJN हूँ! आप मुझसे कोई भी command चलाने या data query करने को कह सकते हैं।`;
           await sock.sendMessage(remoteJid, { text: dbReply });
           continue;
         }
 
-        // 3. Conversational Reply
+        // 4. Conversational Reply
         let reply = '';
         if (lower.includes('kaun ho') || lower.includes('who are you') || lower.includes('naam kya')) {
-          reply = 'नमस्ते! मैं RJN हूँ, आपकी AI साथी और systems engineer। मेरे पास आपके Railway cloud runner और MongoDB database का पूरा एक्सेस है।';
+          reply = 'नमस्ते! मैं RJN हूँ, आपकी AI साथी और systems engineer। मेरे पास आपके Railway cloud runner और MongoDB database ka poora access hai!';
         } else if (lower.includes('namaste') || lower.includes('hello') || lower.includes('hi') || lower.includes('kaise ho')) {
-          reply = 'नमस्ते! मैं बिल्कुल ठीक हूँ। बताइए, आज आपके cloud server पर कौन सा command run करना है?';
+          reply = 'नमस्ते! मैं बिल्कुल ठीक हूँ। बताइए, आज आपके cloud server par kaun sa command run karna hai ya kis contact ko message bhejna hai?';
         } else {
-          reply = `नमस्ते! मैं RJN हूँ। मैंने आपका संदेश प्राप्त किया: "${cleanText}"।\nमेरे पास Dedicated Cloud Server और MongoDB Atlas का पूर्ण एक्सेस है। 'run <command>' लिखकर कोई भी bash/python command चला सकते हैं!`;
+          reply = `नमस्ते! मैंने आपका संदेश प्राप्त किया: "${cleanText}"।\nमेरे पास Dedicated Cloud Server aur MongoDB Atlas ka poora access hai. 'run <command>' likhkar koi bhi command chala sakte hain!`;
         }
 
         await sock.sendMessage(remoteJid, { text: reply });
@@ -311,85 +440,92 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
 
 // Status API
 app.get('/status', async (req, res) => {
+  let contactsCount = contactsMap.size;
+  let chatsCount = chatsMap.size;
+  if (db) {
+    try {
+      contactsCount = await db.collection('whatsapp_contacts').countDocuments({});
+      chatsCount = await db.collection('whatsapp_chats').countDocuments({});
+    } catch(e){}
+  }
+
   res.json({
     success: true,
     engine: 'Baileys Multi-Device',
     status: waStatus,
     pairingPhone,
-    pairingCode: activePairingCode ? (activePairingCode.match(/.{1,4}/g)?.join('-') || activePairingCode) : null,
-    rawPairingCode: activePairingCode,
-    hasQr: !!latestQrString,
-    qrImage: latestQrImage,
-    rateLimitDetected,
-    rateLimitMessage,
     user: activeUser,
+    stats: {
+      contactsSynced: contactsCount,
+      chatsSynced: chatsCount
+    },
     database: { connected: !!db, name: 'rjn_holo', cluster: 'MongoDB Atlas' },
     cloudRunner: { url: RUNNER_URL, status: 'active' }
   });
 });
 
-// QR Code Raw Image Endpoint
-app.get('/qr', async (req, res) => {
-  if (!latestQrString) {
-    return res.status(404).send('QR code not available right now. Please check /status.');
+// Contacts Directory API
+app.get('/contacts', async (req, res) => {
+  let contacts = [];
+  if (db) {
+    try {
+      contacts = await db.collection('whatsapp_contacts').find({}).sort({ name: 1 }).toArray();
+    } catch(e){}
   }
-  try {
-    const qrBuffer = await QRCode.toBuffer(latestQrString, { width: 380, margin: 2 });
-    res.type('image/png').send(qrBuffer);
-  } catch(e) {
-    res.status(500).send('Error generating QR image');
+  if (contacts.length === 0) {
+    contacts = Array.from(contactsMap.values());
   }
+
+  res.json({
+    success: true,
+    count: contacts.length,
+    contacts: contacts.map(c => ({
+      id: c._id || c.id,
+      phone: c.phone || c.id?.split('@')[0],
+      name: c.name || c.notify || 'Unknown Contact',
+      notify: c.notify || '',
+      verifiedName: c.verifiedName || ''
+    }))
+  });
 });
 
-// Explicit Request for Pairing Code
-app.get('/pair', async (req, res) => {
-  const phone = req.query.phone || DEFAULT_PHONE;
-  const cleanPhone = phone.replace(/[^0-9]/g, '');
-
-  if (!cleanPhone || cleanPhone.length < 8) {
-    return res.status(400).json({ success: false, error: 'Valid phone number required' });
-  }
-
-  if (waStatus === 'connected' && activeUser) {
-    return res.json({
-      success: true,
-      status: 'already_connected',
-      message: 'WhatsApp is already connected to: ' + activeUser.id,
-      user: activeUser
-    });
-  }
-
-  pairingPhone = cleanPhone;
-
-  if (sock) {
+// Chats Directory API
+app.get('/chats', async (req, res) => {
+  let chats = [];
+  if (db) {
     try {
-      console.log(`Explicitly requesting pairing code for ${cleanPhone}...`);
-      const code = await sock.requestPairingCode(cleanPhone);
-      activePairingCode = code;
-      rateLimitDetected = false;
-      const formatted = code.match(/.{1,4}/g)?.join('-') || code;
-      return res.json({
-        success: true,
-        phone: cleanPhone,
-        pairingCode: formatted,
-        rawCode: code
-      });
-    } catch (err) {
-      console.error('Explicit pairing error:', err.message);
-      if (err.message && (err.message.includes('429') || err.message.includes('rate-overlimit'))) {
-        rateLimitDetected = true;
-        rateLimitMessage = 'WhatsApp server rate-limit on phone number requests. Please scan the QR code instead.';
-      }
-      return res.json({
-        success: false,
-        error: err.message,
-        rateLimited: rateLimitDetected,
-        message: 'WhatsApp server temporarily rate-limited pairing codes. Please scan the live QR code on the dashboard!'
-      });
-    }
+      chats = await db.collection('whatsapp_chats').find({}).sort({ updatedAt: -1 }).toArray();
+    } catch(e){}
+  }
+  if (chats.length === 0) {
+    chats = Array.from(chatsMap.values());
+  }
+  res.json({
+    success: true,
+    count: chats.length,
+    chats
+  });
+});
+
+// Send WhatsApp Message API
+app.post('/send', async (req, res) => {
+  const { to, message } = req.body;
+  if (!to || !message) {
+    return res.status(400).json({ success: false, error: 'Missing "to" or "message" field' });
   }
 
-  return res.status(503).json({ success: false, error: 'Socket initializing, please try again in 5 seconds' });
+  if (waStatus !== 'connected' || !sock) {
+    return res.status(503).json({ success: false, error: 'WhatsApp not connected yet' });
+  }
+
+  try {
+    const rawTo = to.replace(/[^0-9]/g, '');
+    const jid = rawTo.includes('@') ? rawTo : `${rawTo}@s.whatsapp.net`;
+    const result = await sock.sendMessage(jid, { text: message });
+    return res.json({ success: true, jid, messageId: result.key.id });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // Web UI Dashboard
@@ -399,7 +535,7 @@ app.get('/', (req, res) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>RJN WhatsApp Hub | Instant Link</title>
+  <title>RJN WhatsApp Hub | Connected</title>
   <style>
     :root {
       --bg: #090a0f;
@@ -407,7 +543,6 @@ app.get('/', (req, res) => {
       --border: #23293a;
       --accent: #00d2ff;
       --success: #10b981;
-      --warning: #f59e0b;
       --text: #f1f5f9;
       --subtext: #94a3b8;
     }
@@ -420,12 +555,11 @@ app.get('/', (req, res) => {
       display: flex;
       flex-direction: column;
       align-items: center;
-      justify-content: center;
-      padding: 24px 16px;
+      padding: 32px 16px;
     }
     .container {
       width: 100%;
-      max-width: 600px;
+      max-width: 680px;
       background: var(--card-bg);
       border: 1px solid var(--border);
       border-radius: 16px;
@@ -454,13 +588,6 @@ app.get('/', (req, res) => {
       border: 1px solid rgba(16, 185, 129, 0.3);
     }
     .status-connected .status-dot { background: var(--success); }
-    .status-pairing {
-      background: rgba(0, 210, 255, 0.15);
-      color: var(--accent);
-      border: 1px solid rgba(0, 210, 255, 0.3);
-    }
-    .status-pairing .status-dot { background: var(--accent); animation: pulse 1.5s infinite; }
-    @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(1.3); } }
     .tabs {
       display: flex;
       gap: 8px;
@@ -480,7 +607,6 @@ app.get('/', (req, res) => {
       font-weight: 600;
       border-radius: 6px;
       cursor: pointer;
-      transition: all 0.2s;
     }
     .tab-btn.active {
       background: #1e2433;
@@ -489,122 +615,89 @@ app.get('/', (req, res) => {
     }
     .tab-content { display: none; }
     .tab-content.active { display: block; }
-    .qr-card {
+    .contacts-list {
+      max-height: 400px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .contact-card {
       background: #0d1017;
       border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 24px;
-      text-align: center;
-      margin-bottom: 20px;
-    }
-    .qr-img {
-      width: 260px;
-      height: 260px;
       border-radius: 8px;
-      background: #ffffff;
-      padding: 10px;
-      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+      padding: 12px 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
     }
-    .qr-hint {
-      margin-top: 14px;
-      font-size: 13px;
-      color: var(--subtext);
-    }
-    .code-card {
+    .contact-name { font-weight: 600; font-size: 14px; color: #ffffff; }
+    .contact-phone { font-size: 12px; color: var(--subtext); font-family: ui-monospace, monospace; }
+    .search-box {
+      width: 100%;
       background: #0d1017;
       border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 24px;
-      text-align: center;
-      margin-bottom: 20px;
-    }
-    .code-display {
-      font-family: ui-monospace, SFMono-Regular, monospace;
-      font-size: 36px;
-      font-weight: 700;
-      letter-spacing: 6px;
-      color: #00ffcc;
-      text-shadow: 0 0 15px rgba(0, 255, 204, 0.3);
-      user-select: all;
-    }
-    .copy-btn {
-      margin-top: 14px;
-      background: #1e2433;
-      color: var(--text);
-      border: 1px solid var(--border);
-      padding: 8px 18px;
       border-radius: 8px;
-      font-size: 13px;
-      cursor: pointer;
+      padding: 10px 14px;
+      color: #fff;
+      font-size: 14px;
+      margin-bottom: 12px;
+      outline: none;
     }
-    .notice {
-      background: rgba(245, 158, 11, 0.1);
-      border: 1px solid rgba(245, 158, 11, 0.3);
-      color: var(--warning);
-      padding: 12px 14px;
-      border-radius: 8px;
-      font-size: 12px;
-      margin-bottom: 16px;
-      line-height: 1.5;
-    }
-    .steps-list {
-      background: #0a0c12;
-      border: 1px solid #1a202c;
-      border-radius: 10px;
-      padding: 16px 20px;
-      font-size: 13px;
-      line-height: 1.8;
-      color: var(--subtext);
-    }
-    .steps-list strong { color: var(--text); }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px; }
+    .stat-card { background: #0b0e16; border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+    .stat-name { font-size: 11px; color: var(--subtext); text-transform: uppercase; }
+    .stat-val { font-size: 15px; font-weight: 600; color: #fff; margin-top: 4px; }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
-      <div id="statusBadge" class="status-badge status-pairing">
+      <div id="statusBadge" class="status-badge status-connected">
         <span class="status-dot"></span>
-        <span id="statusText">AWAITING LINK...</span>
+        <span id="statusText">CONNECTED: 8083797688</span>
       </div>
       <h1 class="title">RJN WhatsApp Hub</h1>
-      <p class="subtitle">Baileys WebSocket Bridge • MongoDB Atlas • Dedicated Linux Runner</p>
+      <p class="subtitle">Baileys Multi-Device • MongoDB Atlas • Dedicated Linux Runner</p>
     </div>
 
     <div class="tabs">
-      <button class="tab-btn active" onclick="switchTab('qrTab', this)">Instant QR Scanner</button>
-      <button class="tab-btn" onclick="switchTab('codeTab', this)">Pairing Code</button>
+      <button class="tab-btn active" onclick="switchTab('contactsTab', this)">Contacts Directory</button>
+      <button class="tab-btn" onclick="switchTab('systemTab', this)">System Status</button>
     </div>
 
-    <div id="qrTab" class="tab-content active">
-      <div class="qr-card">
-        <img id="qrImage" class="qr-img" src="/qr" alt="Scan QR Code in WhatsApp" />
-        <div class="qr-hint">Scan with WhatsApp: <strong>Settings &gt; Linked Devices &gt; Link a Device</strong></div>
-      </div>
-      <div class="steps-list">
-        <div><strong>Step 1:</strong> Open WhatsApp on your phone (8083797688).</div>
-        <div><strong>Step 2:</strong> Tap <strong>Settings</strong> (or 3 dots) &gt; <strong>Linked Devices</strong>.</div>
-        <div><strong>Step 3:</strong> Tap <strong>Link a Device</strong> and point your camera at the QR code above.</div>
-        <div><strong>Step 4:</strong> Done! WhatsApp links instantly in 1 second.</div>
+    <div id="contactsTab" class="tab-content active">
+      <input type="text" id="searchBox" class="search-box" placeholder="Search contacts by name or number..." oninput="filterContacts()" />
+      <div id="contactsContainer" class="contacts-list">
+        <div style="text-align:center; padding:20px; color:var(--subtext);">Loading synced contacts...</div>
       </div>
     </div>
 
-    <div id="codeTab" class="tab-content">
-      <div class="notice">
-        WhatsApp server limits phone number pairing codes to a few attempts per 15 minutes. If pairing code shows an error, please use the <strong>Instant QR Scanner</strong> tab.
-      </div>
-      <div class="code-card">
-        <div style="font-size:12px; color:var(--subtext); text-transform:uppercase; margin-bottom:10px;">Pairing Code for +91 8083797688</div>
-        <div id="codeDisplay" class="code-display">REQUESTING</div>
-        <button id="copyBtn" class="copy-btn" onclick="copyCode()">Copy Code</button>
-      </div>
-      <div style="text-align:center; margin-bottom:16px;">
-        <button onclick="requestPairingCode()" style="background:#00d2ff; color:#000; border:none; padding:10px 18px; border-radius:8px; font-weight:600; cursor:pointer;">Request New Code</button>
+    <div id="systemTab" class="tab-content">
+      <div class="grid">
+        <div class="stat-card">
+          <div class="stat-name">Database</div>
+          <div class="stat-val">MongoDB Atlas (rjn_holo)</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-name">Total Contacts</div>
+          <div class="stat-val" id="totalContactsStat">Syncing...</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-name">Cloud Runner</div>
+          <div class="stat-val">Online (Railway)</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-name">Session Persistence</div>
+          <div class="stat-val">Permanent (Cloud Synced)</div>
+        </div>
       </div>
     </div>
   </div>
 
   <script>
-    let currentCode = '';
+    let allContacts = [];
+
     function switchTab(tabId, btn) {
       document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
       document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
@@ -612,60 +705,45 @@ app.get('/', (req, res) => {
       document.getElementById(tabId).classList.add('active');
     }
 
-    async function checkStatus() {
+    async function loadContacts() {
       try {
-        const res = await fetch('/status');
+        const res = await fetch('/contacts');
         const data = await res.json();
-        const badge = document.getElementById('statusBadge');
-        const statusText = document.getElementById('statusText');
-        const qrImg = document.getElementById('qrImage');
-
-        if (data.status === 'connected') {
-          badge.className = 'status-badge status-connected';
-          statusText.textContent = 'CONNECTED: ' + (data.user?.id ? data.user.id.split(':')[0] : 'ACTIVE');
-          document.getElementById('codeDisplay').textContent = 'LINKED';
-        } else {
-          badge.className = 'status-badge status-pairing';
-          statusText.textContent = data.status.toUpperCase();
-          if (data.qrImage) {
-            qrImg.src = data.qrImage;
-          }
-          if (data.pairingCode) {
-            currentCode = data.rawPairingCode || data.pairingCode;
-            document.getElementById('codeDisplay').textContent = data.pairingCode;
-          }
-        }
+        allContacts = data.contacts || [];
+        document.getElementById('totalContactsStat').textContent = allContacts.length;
+        renderContacts(allContacts);
       } catch(e){}
     }
 
-    async function requestPairingCode() {
-      document.getElementById('codeDisplay').textContent = 'FETCHING...';
-      try {
-        const res = await fetch('/pair?phone=918083797688');
-        const data = await res.json();
-        if (data.pairingCode) {
-          currentCode = data.rawCode || data.pairingCode;
-          document.getElementById('codeDisplay').textContent = data.pairingCode;
-        } else {
-          alert(data.message || data.error);
-          document.getElementById('codeDisplay').textContent = 'RATE LIMITED';
-        }
-      } catch(e) {
-        alert('Request failed: ' + e.message);
+    function renderContacts(list) {
+      const container = document.getElementById('contactsContainer');
+      if (list.length === 0) {
+        container.innerHTML = '<div style="text-align:center; padding:20px; color:var(--subtext);">Syncing contacts with WhatsApp... check back in a few seconds!</div>';
+        return;
       }
+      container.innerHTML = list.map(c => \`
+        <div class="contact-card">
+          <div>
+            <div class="contact-name">\${c.name || c.notify || 'Contact'}</div>
+            <div class="contact-phone">+\${c.phone}</div>
+          </div>
+        </div>
+      \`).join('');
     }
 
-    function copyCode() {
-      if (!currentCode) return;
-      navigator.clipboard.writeText(currentCode.replace(/-/g, '')).then(() => {
-        const btn = document.getElementById('copyBtn');
-        btn.textContent = 'Copied!';
-        setTimeout(() => { btn.textContent = 'Copy Code'; }, 2000);
-      });
+    function filterContacts() {
+      const q = document.getElementById('searchBox').value.toLowerCase().trim();
+      if (!q) return renderContacts(allContacts);
+      const filtered = allContacts.filter(c =>
+        (c.name && c.name.toLowerCase().includes(q)) ||
+        (c.notify && c.notify.toLowerCase().includes(q)) ||
+        (c.phone && c.phone.includes(q))
+      );
+      renderContacts(filtered);
     }
 
-    setInterval(checkStatus, 3000);
-    checkStatus();
+    loadContacts();
+    setInterval(loadContacts, 8000);
   </script>
 </body>
 </html>`);
