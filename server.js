@@ -182,12 +182,14 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
       } else if (connection === 'close') {
         waStatus = 'disconnected';
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log(`Connection closed (statusCode: ${statusCode}). Reconnect: ${shouldReconnect}`);
-        isPairingRequested = false;
+        console.log(`WhatsApp connection closed (statusCode: ${statusCode}). ActiveUser: ${!!activeUser}`);
 
-        if (statusCode === DisconnectReason.loggedOut) {
-          console.log('Logged out of WhatsApp. Clearing local auth cache...');
+        // Only treat as true logout if user was previously authenticated
+        if (activeUser && statusCode === DisconnectReason.loggedOut) {
+          console.log('User logged out from WhatsApp device. Clearing auth session...');
+          activeUser = null;
+          isPairingRequested = false;
+          activePairingCode = null;
           if (fs.existsSync(AUTH_DIR)) {
             fs.rmSync(AUTH_DIR, { recursive: true, force: true });
             fs.mkdirSync(AUTH_DIR, { recursive: true });
@@ -196,8 +198,22 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
             await db.collection('whatsapp_auth').deleteMany({});
           }
           setTimeout(() => startWhatsApp(DEFAULT_PHONE), 5000);
-        } else if (shouldReconnect) {
-          setTimeout(() => startWhatsApp(pairingPhone), 4000);
+        } else {
+          // Keep activePairingCode intact in UI so user has time to type it!
+          // Reconnect with a gentle backoff
+          const delay = activeUser ? 3000 : 8000;
+          console.log(`Reconnecting WhatsApp socket in ${delay}ms...`);
+          setTimeout(() => {
+            // Only clear auth on retry if registration failed
+            if (!activeUser && fs.existsSync(AUTH_DIR)) {
+              try {
+                fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+                fs.mkdirSync(AUTH_DIR, { recursive: true });
+              } catch(e){}
+            }
+            isPairingRequested = false;
+            startWhatsApp(pairingPhone);
+          }, delay);
         }
       }
     });
