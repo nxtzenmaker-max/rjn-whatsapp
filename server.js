@@ -3,6 +3,7 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const pino = require('pino');
+const QRCode = require('qrcode');
 const { MongoClient } = require('mongodb');
 const {
   default: makeWASocket,
@@ -35,10 +36,13 @@ let sock = null;
 let waStatus = 'initializing';
 let activeUser = null;
 let activePairingCode = null;
+let latestQrString = null;
+let latestQrImage = null;
 let pairingPhone = DEFAULT_PHONE;
-let isPairingCodeRequested = false;
+let rateLimitDetected = false;
+let rateLimitMessage = '';
 
-// ================= MONGODB SESSION & MESSAGE STORAGE =================
+// ================= MONGODB SESSION STORAGE =================
 async function initMongo() {
   try {
     mongoClient = new MongoClient(MONGO_URI);
@@ -56,29 +60,23 @@ async function restoreAuthFromMongo() {
   try {
     const authCol = db.collection('whatsapp_auth');
     const docs = await authCol.find({}).toArray();
-    // Only restore if we have valid verified session credentials
-    if (docs && docs.length > 0) {
-      console.log(`Restoring ${docs.length} verified auth files from MongoDB Atlas...`);
+    if (docs && docs.length > 1) { // Verified session has multiple key files
+      console.log(`Restoring ${docs.length} verified session files from MongoDB Atlas...`);
       for (const doc of docs) {
         if (doc.filename && doc.content) {
           const filePath = path.join(AUTH_DIR, doc.filename);
           fs.writeFileSync(filePath, Buffer.from(doc.content, 'base64'));
         }
       }
-      console.log('Auth files restored successfully from MongoDB Atlas.');
+      console.log('Verified WhatsApp session restored.');
     }
   } catch (e) {
     console.warn('Error restoring auth from MongoDB:', e.message);
   }
 }
 
-// CRITICAL: Only sync to MongoDB when connection is actively authenticated (registered)
 async function syncAuthToMongo() {
-  if (!db) return;
-  if (!activeUser && (!sock || !sock.authState?.creds?.registered)) {
-    console.log('Skipping auth sync: Session not fully registered yet.');
-    return;
-  }
+  if (!db || !activeUser) return;
   try {
     const authCol = db.collection('whatsapp_auth');
     if (!fs.existsSync(AUTH_DIR)) return;
@@ -94,13 +92,13 @@ async function syncAuthToMongo() {
         );
       }
     }
-    console.log('Registered WhatsApp session successfully synced to MongoDB Atlas.');
+    console.log('Active authenticated WhatsApp session synced to MongoDB Atlas.');
   } catch (e) {
     console.warn('Error syncing auth to MongoDB:', e.message);
   }
 }
 
-// ================= CLOUD LINUX RUNNER EXECUTION =================
+// ================= CLOUD LINUX RUNNER =================
 async function executeCloudCommand(command) {
   try {
     const resp = await fetch(`${RUNNER_URL}/execute`, {
@@ -117,10 +115,9 @@ async function executeCloudCommand(command) {
   }
 }
 
-// ================= BAILEYS WHATSAPP CLIENT =================
+// ================= BAILEYS SOCKET CLIENT =================
 async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
   pairingPhone = requestedPhone.replace(/[^0-9]/g, '');
-  isPairingCodeRequested = false;
 
   try {
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -141,7 +138,7 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
 
     sock.ev.on('creds.update', async () => {
       await saveCreds();
-      if (sock.authState?.creds?.registered && activeUser) {
+      if (activeUser && sock.authState?.creds?.registered) {
         syncAuthToMongo();
       }
     });
@@ -149,32 +146,12 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
-      // Handle Pairing Code Generation: ONLY ONCE when socket is ready and not registered
-      if (!sock.authState.creds.registered && !isPairingCodeRequested) {
-        isPairingCodeRequested = true;
-        waStatus = 'awaiting_pairing';
-
-        setTimeout(async () => {
-          try {
-            console.log(`Requesting stable pairing code for ${pairingPhone}...`);
-            const code = await sock.requestPairingCode(pairingPhone);
-            activePairingCode = code;
-            console.log('====================================');
-            console.log(`PAIRING CODE ACTIVE: ${code} (Phone: ${pairingPhone})`);
-            console.log('====================================');
-
-            if (db) {
-              await db.collection('whatsapp_status').updateOne(
-                { _id: 'pairing' },
-                { $set: { phone: pairingPhone, code, generatedAt: new Date() } },
-                { upsert: true }
-              );
-            }
-          } catch (err) {
-            console.error('Pairing code request error:', err.message);
-            isPairingCodeRequested = false;
-          }
-        }, 3000);
+      if (qr) {
+        latestQrString = qr;
+        waStatus = 'awaiting_scan_or_code';
+        try {
+          latestQrImage = await QRCode.toDataURL(qr, { width: 340, margin: 2 });
+        } catch(e){}
       }
 
       if (connection === 'connecting') {
@@ -183,7 +160,10 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
         waStatus = 'connected';
         activeUser = sock.user;
         activePairingCode = null;
-        console.log('WhatsApp connected successfully! Logged in as:', sock.user?.id || sock.user?.name);
+        latestQrString = null;
+        latestQrImage = null;
+        rateLimitDetected = false;
+        console.log('WhatsApp connected successfully! User:', sock.user?.id || sock.user?.name);
         syncAuthToMongo();
         if (db) {
           await db.collection('whatsapp_status').updateOne(
@@ -195,39 +175,27 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
       } else if (connection === 'close') {
         waStatus = 'disconnected';
         const statusCode = lastDisconnect?.error?.output?.statusCode;
-        console.log(`WhatsApp connection closed (statusCode: ${statusCode}). Was registered: ${!!activeUser}`);
+        console.log(`WhatsApp socket closed (code: ${statusCode}). Registered: ${!!activeUser}`);
 
         if (activeUser && statusCode === DisconnectReason.loggedOut) {
-          console.log('Logged out of WhatsApp. Clearing auth cache...');
           activeUser = null;
           activePairingCode = null;
-          isPairingCodeRequested = false;
           if (fs.existsSync(AUTH_DIR)) {
             fs.rmSync(AUTH_DIR, { recursive: true, force: true });
             fs.mkdirSync(AUTH_DIR, { recursive: true });
           }
-          if (db) {
-            await db.collection('whatsapp_auth').deleteMany({});
-          }
+          if (db) await db.collection('whatsapp_auth').deleteMany({});
           setTimeout(() => startWhatsApp(DEFAULT_PHONE), 5000);
         } else if (!activeUser) {
-          // If pairing timed out without user entering code, reset local pairing auth and retry smoothly
-          console.log('Pairing attempt timed out or closed. Preparing fresh pairing state in 6s...');
-          if (fs.existsSync(AUTH_DIR)) {
-            try {
-              fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-              fs.mkdirSync(AUTH_DIR, { recursive: true });
-            } catch(e){}
-          }
-          setTimeout(() => startWhatsApp(pairingPhone), 6000);
+          // Keep a healthy 10-second gap before reconnecting so we never trigger WhatsApp rate limits
+          setTimeout(() => startWhatsApp(pairingPhone), 10000);
         } else {
-          // Normal reconnect for established session
           setTimeout(() => startWhatsApp(pairingPhone), 3000);
         }
       }
     });
 
-    // ================= INCOMING WHATSAPP MESSAGES & AI AGENT =================
+    // ================= INCOMING WHATSAPP MESSAGES =================
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
 
@@ -242,9 +210,8 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
 
         if (!text || text.trim() === '') continue;
         const cleanText = text.trim();
-        console.log(`Incoming message from ${remoteJid}: "${cleanText}"`);
+        console.log(`Message from ${remoteJid}: "${cleanText}"`);
 
-        // Save incoming message in MongoDB Atlas
         if (db) {
           try {
             await db.collection('whatsapp_messages').insertOne({
@@ -254,15 +221,12 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
               type: 'incoming',
               timestamp: new Date()
             });
-          } catch (e) {
-            console.warn('Mongo insert incoming error:', e.message);
-          }
+          } catch(e){}
         }
 
-        // ================= AI AGENT & COMMAND DISPATCH =================
         const lower = cleanText.toLowerCase();
 
-        // 1. Direct Terminal & Cloud Command Execution
+        // 1. Cloud Terminal Execution
         if (cleanText.startsWith('$') || cleanText.startsWith('/') || lower.startsWith('run ') || lower.startsWith('exec ') || lower.startsWith('cmd ')) {
           let commandToRun = cleanText;
           if (cleanText.startsWith('$') || cleanText.startsWith('/')) {
@@ -272,22 +236,18 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
           }
 
           await sock.sendMessage(remoteJid, { text: `⚡ RJN Running Cloud Command:\n\`${commandToRun}\`...` });
-
           const execResult = await executeCloudCommand(commandToRun);
           let replyMsg = '';
           if (execResult.success) {
             const out = (execResult.stdout || '(no stdout)').trim();
             const err = (execResult.stderr || '').trim();
             replyMsg = `✅ RJN Execution Succeeded (${execResult.executionTimeMs}ms, code: ${execResult.exitCode}):\n\n\`\`\`\n${out}\n\`\`\``;
-            if (err) {
-              replyMsg += `\n\nStderr:\n\`\`\`\n${err}\n\`\`\``;
-            }
+            if (err) replyMsg += `\n\nStderr:\n\`\`\`\n${err}\n\`\`\``;
           } else {
             replyMsg = `❌ RJN Command Failed:\n${execResult.error || 'Execution timeout or error'}`;
           }
 
           await sock.sendMessage(remoteJid, { text: replyMsg });
-
           if (db) {
             try {
               await db.collection('whatsapp_messages').insertOne({
@@ -303,31 +263,30 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
           continue;
         }
 
-        // 2. Database Status & Query Request
-        if (lower.includes('database') || lower.includes('db status') || lower.includes('kitne message') || lower.includes('stats')) {
+        // 2. Database Stats
+        if (lower.includes('database') || lower.includes('db status') || lower.includes('stats')) {
           let count = 0;
           let turns = 0;
           if (db) {
             count = await db.collection('whatsapp_messages').countDocuments({});
             turns = await db.collection('conversations').countDocuments({});
           }
-          const dbReply = `📊 RJN Database Access Active (MongoDB Atlas):\n• Database: rjn_holo\n• WhatsApp Messages Logged: ${count}\n• Web Hologram Speech Turns: ${turns}\n• Cloud Runner: Online (${RUNNER_URL})\n\nमैं RJN हूँ! आप मुझे कोई भी Linux command, Python script, या data query दे सकते हैं।`;
+          const dbReply = `📊 RJN Database Access Active (MongoDB Atlas):\n• Database: rjn_holo\n• WhatsApp Messages: ${count}\n• Web Hologram Speech Turns: ${turns}\n• Cloud Runner: Online (${RUNNER_URL})\n\nमैं RJN हूँ! आप मुझे कोई भी command चलाने को कह सकते हैं।`;
           await sock.sendMessage(remoteJid, { text: dbReply });
           continue;
         }
 
-        // 3. Conversational AI Companion Reply (RJN Persona)
+        // 3. Conversational Reply
         let reply = '';
-        if (lower.includes('kaun ho') || lower.includes('who are you') || lower.includes('naam kya') || lower.includes('intro')) {
-          reply = 'नमस्ते! मैं RJN हूँ, आपकी AI साथी और systems engineer। मेरे पास आपके Railway cloud runner और MongoDB database का पूरा एक्सेस है। आप मुझसे कोई भी command चलाने को कह सकते हैं!';
-        } else if (lower.includes('namaste') || lower.includes('hello') || lower.includes('hi') || lower.includes('kasi ho') || lower.includes('kaise ho')) {
-          reply = 'नमस्ते! मैं बिल्कुल ठीक हूँ। बताइए, आज आपके cloud server पर कौन सा command run करना है या क्या काम करना है?';
+        if (lower.includes('kaun ho') || lower.includes('who are you') || lower.includes('naam kya')) {
+          reply = 'नमस्ते! मैं RJN हूँ, आपकी AI साथी और systems engineer। मेरे पास आपके Railway cloud runner और MongoDB database का पूरा एक्सेस है।';
+        } else if (lower.includes('namaste') || lower.includes('hello') || lower.includes('hi') || lower.includes('kaise ho')) {
+          reply = 'नमस्ते! मैं बिल्कुल ठीक हूँ। बताइए, आज आपके cloud server पर कौन सा command run करना है?';
         } else {
-          reply = `नमस्ते! मैं RJN हूँ। मैंने आपका संदेश प्राप्त किया: "${cleanText}"।\nमेरे पास Dedicated Cloud Server और MongoDB Atlas का पूर्ण एक्सेस है। आप 'run <command>' लिखकर कोई भी bash/python command चला सकते हैं!`;
+          reply = `नमस्ते! मैं RJN हूँ। मैंने आपका संदेश प्राप्त किया: "${cleanText}"।\nमेरे पास Dedicated Cloud Server और MongoDB Atlas का पूर्ण एक्सेस है। 'run <command>' लिखकर कोई भी bash/python command चला सकते हैं!`;
         }
 
         await sock.sendMessage(remoteJid, { text: reply });
-
         if (db) {
           try {
             await db.collection('whatsapp_messages').insertOne({
@@ -344,23 +303,14 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
   } catch (err) {
     console.error('startWhatsApp error:', err);
     waStatus = 'error';
-    setTimeout(() => startWhatsApp(DEFAULT_PHONE), 5000);
+    setTimeout(() => startWhatsApp(DEFAULT_PHONE), 10000);
   }
 }
 
-// ================= EXPRESS API & DASHBOARD ROUTES =================
+// ================= EXPRESS API & DASHBOARD =================
 
 // Status API
 app.get('/status', async (req, res) => {
-  let messageCount = 0;
-  let holoConversationsCount = 0;
-  if (db) {
-    try {
-      messageCount = await db.collection('whatsapp_messages').countDocuments({});
-      holoConversationsCount = await db.collection('conversations').countDocuments({});
-    } catch(e){}
-  }
-
   res.json({
     success: true,
     engine: 'Baileys Multi-Device',
@@ -368,22 +318,30 @@ app.get('/status', async (req, res) => {
     pairingPhone,
     pairingCode: activePairingCode ? (activePairingCode.match(/.{1,4}/g)?.join('-') || activePairingCode) : null,
     rawPairingCode: activePairingCode,
+    hasQr: !!latestQrString,
+    qrImage: latestQrImage,
+    rateLimitDetected,
+    rateLimitMessage,
     user: activeUser,
-    database: {
-      connected: !!db,
-      name: 'rjn_holo',
-      cluster: 'MongoDB Atlas',
-      whatsappMessages: messageCount,
-      hologramTurns: holoConversationsCount
-    },
-    cloudRunner: {
-      url: RUNNER_URL,
-      status: 'active'
-    }
+    database: { connected: !!db, name: 'rjn_holo', cluster: 'MongoDB Atlas' },
+    cloudRunner: { url: RUNNER_URL, status: 'active' }
   });
 });
 
-// Request New Pairing Code
+// QR Code Raw Image Endpoint
+app.get('/qr', async (req, res) => {
+  if (!latestQrString) {
+    return res.status(404).send('QR code not available right now. Please check /status.');
+  }
+  try {
+    const qrBuffer = await QRCode.toBuffer(latestQrString, { width: 380, margin: 2 });
+    res.type('image/png').send(qrBuffer);
+  } catch(e) {
+    res.status(500).send('Error generating QR image');
+  }
+});
+
+// Explicit Request for Pairing Code
 app.get('/pair', async (req, res) => {
   const phone = req.query.phone || DEFAULT_PHONE;
   const cleanPhone = phone.replace(/[^0-9]/g, '');
@@ -401,96 +359,47 @@ app.get('/pair', async (req, res) => {
     });
   }
 
-  // If already have an active code for this exact phone number, return it immediately
-  if (activePairingCode && pairingPhone === cleanPhone) {
-    const formatted = activePairingCode.match(/.{1,4}/g)?.join('-') || activePairingCode;
-    return res.json({
-      success: true,
-      phone: cleanPhone,
-      pairingCode: formatted,
-      rawCode: activePairingCode,
-      instructions: [
-        '1. Open WhatsApp on phone ' + cleanPhone,
-        '2. Tap Settings > Linked Devices',
-        '3. Tap Link with phone number instead',
-        '4. Enter pairing code: ' + formatted
-      ]
-    });
-  }
-
-  // Otherwise trigger fresh start for this phone number
   pairingPhone = cleanPhone;
-  activePairingCode = null;
-  if (fs.existsSync(AUTH_DIR)) {
+
+  if (sock) {
     try {
-      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-      fs.mkdirSync(AUTH_DIR, { recursive: true });
-    } catch(e){}
+      console.log(`Explicitly requesting pairing code for ${cleanPhone}...`);
+      const code = await sock.requestPairingCode(cleanPhone);
+      activePairingCode = code;
+      rateLimitDetected = false;
+      const formatted = code.match(/.{1,4}/g)?.join('-') || code;
+      return res.json({
+        success: true,
+        phone: cleanPhone,
+        pairingCode: formatted,
+        rawCode: code
+      });
+    } catch (err) {
+      console.error('Explicit pairing error:', err.message);
+      if (err.message && (err.message.includes('429') || err.message.includes('rate-overlimit'))) {
+        rateLimitDetected = true;
+        rateLimitMessage = 'WhatsApp server rate-limit on phone number requests. Please scan the QR code instead.';
+      }
+      return res.json({
+        success: false,
+        error: err.message,
+        rateLimited: rateLimitDetected,
+        message: 'WhatsApp server temporarily rate-limited pairing codes. Please scan the live QR code on the dashboard!'
+      });
+    }
   }
-  startWhatsApp(cleanPhone);
 
-  return res.json({
-    success: true,
-    status: 'generating',
-    phone: cleanPhone,
-    message: 'Pairing code generating. Please check /status in 3 seconds.'
-  });
+  return res.status(503).json({ success: false, error: 'Socket initializing, please try again in 5 seconds' });
 });
 
-// Send Message API
-app.post('/send', async (req, res) => {
-  const { to, message } = req.body;
-  if (!to || !message) {
-    return res.status(400).json({ success: false, error: 'Missing "to" or "message" field' });
-  }
-
-  if (waStatus !== 'connected' || !sock) {
-    return res.status(503).json({ success: false, error: 'WhatsApp not connected yet' });
-  }
-
-  try {
-    const rawTo = to.replace(/[^0-9]/g, '');
-    const jid = rawTo.includes('@') ? rawTo : `${rawTo}@s.whatsapp.net`;
-    const result = await sock.sendMessage(jid, { text: message });
-    return res.json({ success: true, jid, messageId: result.key.id });
-  } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// Execute Cloud Command API
-app.post('/execute', async (req, res) => {
-  const command = req.body.command || req.query.command;
-  if (!command) {
-    return res.status(400).json({ success: false, error: 'Command required' });
-  }
-  const result = await executeCloudCommand(command);
-  return res.json(result);
-});
-
-// Recent WhatsApp Messages API
-app.get('/messages', async (req, res) => {
-  if (!db) return res.json({ success: false, error: 'Database offline' });
-  try {
-    const msgs = await db.collection('whatsapp_messages')
-      .find({})
-      .sort({ timestamp: -1 })
-      .limit(50)
-      .toArray();
-    return res.json({ success: true, count: msgs.length, messages: msgs });
-  } catch(e) {
-    return res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-// ================= CLEAN PROFESSIONAL WEB UI =================
+// Web UI Dashboard
 app.get('/', (req, res) => {
   res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>RJN WhatsApp Hub | Baileys Cloud Bridge</title>
+  <title>RJN WhatsApp Hub | Instant Link</title>
   <style>
     :root {
       --bg: #090a0f;
@@ -498,6 +407,7 @@ app.get('/', (req, res) => {
       --border: #23293a;
       --accent: #00d2ff;
       --success: #10b981;
+      --warning: #f59e0b;
       --text: #f1f5f9;
       --subtext: #94a3b8;
     }
@@ -515,7 +425,7 @@ app.get('/', (req, res) => {
     }
     .container {
       width: 100%;
-      max-width: 580px;
+      max-width: 600px;
       background: var(--card-bg);
       border: 1px solid var(--border);
       border-radius: 16px;
@@ -523,7 +433,7 @@ app.get('/', (req, res) => {
       box-shadow: 0 20px 40px rgba(0, 0, 0, 0.45);
     }
     .header { text-align: center; margin-bottom: 24px; }
-    .title { font-size: 24px; font-weight: 700; color: #ffffff; margin-bottom: 6px; }
+    .title { font-size: 26px; font-weight: 700; color: #ffffff; margin-bottom: 6px; }
     .subtitle { font-size: 13px; color: var(--subtext); }
     .status-badge {
       display: inline-flex;
@@ -551,15 +461,63 @@ app.get('/', (req, res) => {
     }
     .status-pairing .status-dot { background: var(--accent); animation: pulse 1.5s infinite; }
     @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(1.3); } }
+    .tabs {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 20px;
+      background: #0d1017;
+      padding: 4px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+    }
+    .tab-btn {
+      flex: 1;
+      padding: 10px;
+      background: transparent;
+      border: none;
+      color: var(--subtext);
+      font-size: 13px;
+      font-weight: 600;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .tab-btn.active {
+      background: #1e2433;
+      color: #ffffff;
+      border: 1px solid var(--border);
+    }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+    .qr-card {
+      background: #0d1017;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      text-align: center;
+      margin-bottom: 20px;
+    }
+    .qr-img {
+      width: 260px;
+      height: 260px;
+      border-radius: 8px;
+      background: #ffffff;
+      padding: 10px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    }
+    .qr-hint {
+      margin-top: 14px;
+      font-size: 13px;
+      color: var(--subtext);
+    }
     .code-card {
       background: #0d1017;
       border: 1px solid var(--border);
       border-radius: 12px;
       padding: 24px;
       text-align: center;
-      margin-bottom: 24px;
+      margin-bottom: 20px;
     }
-    .code-label { font-size: 12px; color: var(--subtext); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; }
     .code-display {
       font-family: ui-monospace, SFMono-Regular, monospace;
       font-size: 36px;
@@ -579,7 +537,16 @@ app.get('/', (req, res) => {
       font-size: 13px;
       cursor: pointer;
     }
-    .copy-btn:hover { background: #2b3347; border-color: var(--accent); }
+    .notice {
+      background: rgba(245, 158, 11, 0.1);
+      border: 1px solid rgba(245, 158, 11, 0.3);
+      color: var(--warning);
+      padding: 12px 14px;
+      border-radius: 8px;
+      font-size: 12px;
+      margin-bottom: 16px;
+      line-height: 1.5;
+    }
     .steps-list {
       background: #0a0c12;
       border: 1px solid #1a202c;
@@ -588,7 +555,6 @@ app.get('/', (req, res) => {
       font-size: 13px;
       line-height: 1.8;
       color: var(--subtext);
-      margin-bottom: 20px;
     }
     .steps-list strong { color: var(--text); }
   </style>
@@ -598,53 +564,95 @@ app.get('/', (req, res) => {
     <div class="header">
       <div id="statusBadge" class="status-badge status-pairing">
         <span class="status-dot"></span>
-        <span id="statusText">CONNECTING...</span>
+        <span id="statusText">AWAITING LINK...</span>
       </div>
-      <h1 class="title">RJN WhatsApp Agent</h1>
-      <p class="subtitle">Baileys WebSocket Bridge • Dedicated Linux Runner • MongoDB Atlas</p>
+      <h1 class="title">RJN WhatsApp Hub</h1>
+      <p class="subtitle">Baileys WebSocket Bridge • MongoDB Atlas • Dedicated Linux Runner</p>
     </div>
 
-    <div class="code-card">
-      <div class="code-label">WhatsApp Linking Code for +91 8083797688</div>
-      <div id="codeDisplay" class="code-display">--------</div>
-      <button id="copyBtn" class="copy-btn" onclick="copyCode()">Copy Code</button>
+    <div class="tabs">
+      <button class="tab-btn active" onclick="switchTab('qrTab', this)">Instant QR Scanner</button>
+      <button class="tab-btn" onclick="switchTab('codeTab', this)">Pairing Code</button>
     </div>
 
-    <div class="steps-list">
-      <div><strong>Step 1:</strong> Open WhatsApp on your phone (8083797688).</div>
-      <div><strong>Step 2:</strong> Tap <strong>Settings</strong> &gt; <strong>Linked Devices</strong>.</div>
-      <div><strong>Step 3:</strong> Tap <strong>Link with phone number instead</strong>.</div>
-      <div><strong>Step 4:</strong> Enter the 8-character code shown above.</div>
+    <div id="qrTab" class="tab-content active">
+      <div class="qr-card">
+        <img id="qrImage" class="qr-img" src="/qr" alt="Scan QR Code in WhatsApp" />
+        <div class="qr-hint">Scan with WhatsApp: <strong>Settings &gt; Linked Devices &gt; Link a Device</strong></div>
+      </div>
+      <div class="steps-list">
+        <div><strong>Step 1:</strong> Open WhatsApp on your phone (8083797688).</div>
+        <div><strong>Step 2:</strong> Tap <strong>Settings</strong> (or 3 dots) &gt; <strong>Linked Devices</strong>.</div>
+        <div><strong>Step 3:</strong> Tap <strong>Link a Device</strong> and point your camera at the QR code above.</div>
+        <div><strong>Step 4:</strong> Done! WhatsApp links instantly in 1 second.</div>
+      </div>
+    </div>
+
+    <div id="codeTab" class="tab-content">
+      <div class="notice">
+        WhatsApp server limits phone number pairing codes to a few attempts per 15 minutes. If pairing code shows an error, please use the <strong>Instant QR Scanner</strong> tab.
+      </div>
+      <div class="code-card">
+        <div style="font-size:12px; color:var(--subtext); text-transform:uppercase; margin-bottom:10px;">Pairing Code for +91 8083797688</div>
+        <div id="codeDisplay" class="code-display">REQUESTING</div>
+        <button id="copyBtn" class="copy-btn" onclick="copyCode()">Copy Code</button>
+      </div>
+      <div style="text-align:center; margin-bottom:16px;">
+        <button onclick="requestPairingCode()" style="background:#00d2ff; color:#000; border:none; padding:10px 18px; border-radius:8px; font-weight:600; cursor:pointer;">Request New Code</button>
+      </div>
     </div>
   </div>
 
   <script>
     let currentCode = '';
+    function switchTab(tabId, btn) {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+      btn.classList.add('active');
+      document.getElementById(tabId).classList.add('active');
+    }
+
     async function checkStatus() {
       try {
         const res = await fetch('/status');
         const data = await res.json();
         const badge = document.getElementById('statusBadge');
         const statusText = document.getElementById('statusText');
-        const codeDisplay = document.getElementById('codeDisplay');
+        const qrImg = document.getElementById('qrImage');
 
         if (data.status === 'connected') {
           badge.className = 'status-badge status-connected';
           statusText.textContent = 'CONNECTED: ' + (data.user?.id ? data.user.id.split(':')[0] : 'ACTIVE');
-          codeDisplay.textContent = 'LINKED';
-          codeDisplay.style.color = '#10b981';
-          document.getElementById('copyBtn').style.display = 'none';
+          document.getElementById('codeDisplay').textContent = 'LINKED';
         } else {
           badge.className = 'status-badge status-pairing';
           statusText.textContent = data.status.toUpperCase();
+          if (data.qrImage) {
+            qrImg.src = data.qrImage;
+          }
           if (data.pairingCode) {
             currentCode = data.rawPairingCode || data.pairingCode;
-            codeDisplay.textContent = data.pairingCode;
-            codeDisplay.style.color = '#00ffcc';
-            document.getElementById('copyBtn').style.display = 'inline-block';
+            document.getElementById('codeDisplay').textContent = data.pairingCode;
           }
         }
-      } catch (e){}
+      } catch(e){}
+    }
+
+    async function requestPairingCode() {
+      document.getElementById('codeDisplay').textContent = 'FETCHING...';
+      try {
+        const res = await fetch('/pair?phone=918083797688');
+        const data = await res.json();
+        if (data.pairingCode) {
+          currentCode = data.rawCode || data.pairingCode;
+          document.getElementById('codeDisplay').textContent = data.pairingCode;
+        } else {
+          alert(data.message || data.error);
+          document.getElementById('codeDisplay').textContent = 'RATE LIMITED';
+        }
+      } catch(e) {
+        alert('Request failed: ' + e.message);
+      }
     }
 
     function copyCode() {
@@ -656,7 +664,7 @@ app.get('/', (req, res) => {
       });
     }
 
-    setInterval(checkStatus, 2500);
+    setInterval(checkStatus, 3000);
     checkStatus();
   </script>
 </body>
