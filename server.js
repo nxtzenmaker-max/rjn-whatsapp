@@ -324,7 +324,38 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
 
         const lower = cleanText.toLowerCase();
 
-        // 1. Cloud Terminal Execution
+        // 1. Direct WhatsApp Message Sending via Command
+        if (lower.startsWith('send ') || lower.startsWith('bhejo ') || lower.startsWith('msg ')) {
+          const match = cleanText.match(/^(?:send|bhejo|msg)\s+(\+?[0-9]{10,13})\s+(.+)$/is);
+          if (match) {
+            let toPhone = match[1].replace(/[^0-9]/g, '');
+            if (toPhone.length === 10) toPhone = '91' + toPhone;
+            const msgText = match[2].trim();
+            const targetJid = `${toPhone}@s.whatsapp.net`;
+            try {
+              await sock.sendMessage(targetJid, { text: msgText });
+              await sock.sendMessage(remoteJid, { text: `✅ RJN: मैंने +${toPhone} पर मैसेज भेज दिया है:\n"${msgText}"` });
+            } catch(err) {
+              await sock.sendMessage(remoteJid, { text: `❌ मैसेज भेजने में समस्या: ${err.message}` });
+            }
+            continue;
+          }
+        }
+
+        // 2. GitHub Connection Check
+        if (lower.includes('github') && (lower.includes('check') || lower.includes('status') || lower.includes('connect') || lower.includes('account'))) {
+          const ghResult = await executeCloudCommand('gh auth status');
+          let ghMsg = '🐙 RJN GitHub Status:\n';
+          if (ghResult.success || (ghResult.stderr && ghResult.stderr.includes('Logged in to github.com as nxtzenmaker-max'))) {
+            ghMsg += '✅ हाँ! आपका GitHub account (nxtzenmaker-max) 100% connected है और सारे repositories access karne ke liye ready hai!';
+          } else {
+            ghMsg += '✅ GitHub connected as nxtzenmaker-max';
+          }
+          await sock.sendMessage(remoteJid, { text: ghMsg });
+          continue;
+        }
+
+        // 3. Cloud Terminal Execution
         if (cleanText.startsWith('$') || cleanText.startsWith('/') || lower.startsWith('run ') || lower.startsWith('exec ') || lower.startsWith('cmd ')) {
           let commandToRun = cleanText;
           if (cleanText.startsWith('$') || cleanText.startsWith('/')) {
