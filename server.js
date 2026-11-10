@@ -531,11 +531,139 @@ app.get('/chats', async (req, res) => {
   if (chats.length === 0) {
     chats = Array.from(chatsMap.values());
   }
+  // Synthesize from recent messages if chats collection & map are empty
+  if (chats.length === 0 && db) {
+    try {
+      const recentGroups = await db.collection('whatsapp_messages').aggregate([
+        { $sort: { timestamp: -1 } },
+        { $group: {
+            _id: { $ifNull: ["$from", "$to"] },
+            lastMessage: { $first: "$text" },
+            lastTimestamp: { $first: "$timestamp" },
+            senderName: { $first: "$senderName" },
+            type: { $first: "$type" }
+        }},
+        { $sort: { lastTimestamp: -1 } },
+        { $limit: 30 }
+      ]).toArray();
+
+      chats = recentGroups.map(g => ({
+        id: g._id,
+        name: g.senderName || g._id,
+        lastMessage: g.lastMessage,
+        updatedAt: g.lastTimestamp
+      }));
+    } catch (e) {
+      console.warn('Error aggregating chats:', e.message);
+    }
+  }
+
   res.json({
     success: true,
     count: chats.length,
     chats
   });
+});
+
+// Recent WhatsApp Messages API (Retrieve logged messages)
+app.all('/messages', async (req, res) => {
+  let msgs = [];
+  if (db) {
+    try {
+      const limit = Math.min(parseInt(req.query.limit || req.body?.limit) || 50, 200);
+      const query = {};
+      const targetPhone = req.query.phone || req.query.from || req.query.to || req.query.jid || req.body?.phone || req.body?.to;
+      if (targetPhone) {
+        const clean = String(targetPhone).replace(/[^0-9]/g, '');
+        if (clean) {
+          query.$or = [
+            { from: { $regex: clean } },
+            { to: { $regex: clean } }
+          ];
+        }
+      }
+      msgs = await db.collection('whatsapp_messages')
+        .find(query)
+        .sort({ timestamp: -1 })
+        .limit(limit)
+        .toArray();
+    } catch (e) {
+      console.warn('Error fetching messages from MongoDB:', e.message);
+      return res.status(500).json({ success: false, error: e.message });
+    }
+  } else {
+    return res.status(503).json({ success: false, error: 'Database disconnected' });
+  }
+
+  return res.json({
+    success: true,
+    count: msgs.length,
+    messages: msgs
+  });
+});
+
+// Request New Pairing Code
+app.get('/pair', async (req, res) => {
+  const phone = req.query.phone || DEFAULT_PHONE;
+  const cleanPhone = phone.replace(/[^0-9]/g, '');
+
+  if (!cleanPhone || cleanPhone.length < 8) {
+    return res.status(400).json({ success: false, error: 'Valid phone number required' });
+  }
+
+  if (waStatus === 'connected' && activeUser) {
+    return res.json({
+      success: true,
+      status: 'already_connected',
+      message: 'WhatsApp is already connected to: ' + (activeUser.id || activeUser.name),
+      user: activeUser
+    });
+  }
+
+  // If already have an active code for this exact phone number, return it immediately
+  if (activePairingCode && pairingPhone === cleanPhone) {
+    const formatted = activePairingCode.match(/.{1,4}/g)?.join('-') || activePairingCode;
+    return res.json({
+      success: true,
+      phone: cleanPhone,
+      pairingCode: formatted,
+      rawCode: activePairingCode,
+      instructions: [
+        '1. Open WhatsApp on phone ' + cleanPhone,
+        '2. Tap Settings > Linked Devices',
+        '3. Tap Link with phone number instead',
+        '4. Enter pairing code: ' + formatted
+      ]
+    });
+  }
+
+  // Otherwise trigger fresh start for this phone number
+  pairingPhone = cleanPhone;
+  activePairingCode = null;
+  if (fs.existsSync(AUTH_DIR)) {
+    try {
+      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+      fs.mkdirSync(AUTH_DIR, { recursive: true });
+    } catch(e){}
+  }
+  startWhatsApp(cleanPhone);
+
+  return res.json({
+    success: true,
+    status: 'generating',
+    phone: cleanPhone,
+    message: 'Pairing code generating. Please check /status in 3 seconds.'
+  });
+});
+
+// Execute Cloud Command API
+app.post('/execute', async (req, res) => {
+  const command = req.body?.command || req.query?.command;
+  if (!command) {
+    return res.status(400).json({ success: false, error: 'Command required' });
+  }
+  const result = await executeCloudCommand(command);
+  return res.json(result);
 });
 
 // Send WhatsApp Message API
@@ -694,6 +822,7 @@ app.get('/', (req, res) => {
 
     <div class="tabs">
       <button class="tab-btn active" onclick="switchTab('contactsTab', this)">Contacts Directory</button>
+      <button class="tab-btn" onclick="switchTab('messagesTab', this)">Recent Messages</button>
       <button class="tab-btn" onclick="switchTab('systemTab', this)">System Status</button>
     </div>
 
@@ -701,6 +830,12 @@ app.get('/', (req, res) => {
       <input type="text" id="searchBox" class="search-box" placeholder="Search contacts by name or number..." oninput="filterContacts()" />
       <div id="contactsContainer" class="contacts-list">
         <div style="text-align:center; padding:20px; color:var(--subtext);">Loading synced contacts...</div>
+      </div>
+    </div>
+
+    <div id="messagesTab" class="tab-content">
+      <div id="messagesContainer" class="contacts-list">
+        <div style="text-align:center; padding:20px; color:var(--subtext);">Loading recent messages...</div>
       </div>
     </div>
 
@@ -773,8 +908,32 @@ app.get('/', (req, res) => {
       renderContacts(filtered);
     }
 
+    async function loadMessages() {
+      try {
+        const res = await fetch('/messages');
+        const data = await res.json();
+        const msgs = data.messages || [];
+        const container = document.getElementById('messagesContainer');
+        if (msgs.length === 0) {
+          container.innerHTML = '<div style="text-align:center; padding:20px; color:var(--subtext);">No messages logged yet</div>';
+          return;
+        }
+        container.innerHTML = msgs.slice(0, 30).map(m => \`
+          <div class="contact-card">
+            <div>
+              <div class="contact-name">\${m.senderName || m.from || m.to} <span style="font-size:11px; opacity:0.7;">(\${m.type || 'msg'})</span></div>
+              <div style="font-size:13px; color:#e2e8f0; margin-top:4px;">\${m.text || ''}</div>
+              <div class="contact-phone" style="margin-top:2px;">\${m.timestamp ? new Date(m.timestamp).toLocaleTimeString() : ''}</div>
+            </div>
+          </div>
+        \`).join('');
+      } catch(e){}
+    }
+
     loadContacts();
+    loadMessages();
     setInterval(loadContacts, 8000);
+    setInterval(loadMessages, 5000);
   </script>
 </body>
 </html>`);
