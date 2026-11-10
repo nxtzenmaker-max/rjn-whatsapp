@@ -361,8 +361,8 @@ app.get('/status', async (req, res) => {
       contactsSynced: contactsCount,
       chatsSynced: chatsCount
     },
-    database: { connected: !!db, name: 'rjn_holo', cluster: 'MongoDB Atlas' },
-    cloudRunner: { url: RUNNER_URL, status: 'active' }
+    database: { connected: !!db, status: 'secure_active' },
+    cloudRunner: { status: 'active' }
   });
 });
 
@@ -688,7 +688,7 @@ app.get('/', (req, res) => {
         <span id="statusText">CONNECTED: 8083797688</span>
       </div>
       <h1 class="title">RJN WhatsApp Hub</h1>
-      <p class="subtitle">Baileys Multi-Device • MongoDB Atlas • Dedicated Linux Runner</p>
+      <p class="subtitle">Baileys Multi-Device • Secure Cloud Sync</p>
     </div>
 
     <div class="tabs">
@@ -714,7 +714,7 @@ app.get('/', (req, res) => {
       <div class="grid">
         <div class="stat-card">
           <div class="stat-name">Database</div>
-          <div class="stat-val">MongoDB Atlas (rjn_holo)</div>
+          <div class="stat-val">Secure Cloud Database</div>
         </div>
         <div class="stat-card">
           <div class="stat-name">Total Contacts</div>
