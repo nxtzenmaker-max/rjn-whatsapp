@@ -537,11 +537,11 @@ app.post('/execute', async (req, res) => {
   return res.json(result);
 });
 
-// Send WhatsApp Message API
+// Send WhatsApp Message or Image API
 app.post('/send', async (req, res) => {
-  const { to, message } = req.body;
-  if (!to || !message) {
-    return res.status(400).json({ success: false, error: 'Missing "to" or "message" field' });
+  const { to, message, imageUrl, image, caption } = req.body;
+  if (!to || (!message && !imageUrl && !image)) {
+    return res.status(400).json({ success: false, error: 'Missing "to" and ("message" or "imageUrl") field' });
   }
 
   if (waStatus !== 'connected' || !sock) {
@@ -549,11 +549,42 @@ app.post('/send', async (req, res) => {
   }
 
   try {
-    const rawTo = to.replace(/[^0-9]/g, '');
+    const rawTo = String(to).replace(/[^0-9]/g, '');
     const jid = rawTo.includes('@') ? rawTo : `${rawTo}@s.whatsapp.net`;
-    const result = await sock.sendMessage(jid, { text: message });
-    return res.json({ success: true, jid, messageId: result.key.id });
+    const imgUrl = (imageUrl || image || '').trim();
+
+    let result;
+    if (imgUrl) {
+      console.log(`📸 Sending WhatsApp image to ${jid}: ${imgUrl}`);
+      result = await sock.sendMessage(jid, {
+        image: { url: imgUrl },
+        caption: caption || message || ''
+      });
+    } else {
+      console.log(`💬 Sending WhatsApp text to ${jid}: ${message}`);
+      result = await sock.sendMessage(jid, { text: message });
+    }
+
+    if (db) {
+      try {
+        await db.collection('whatsapp_messages').insertOne({
+          to: jid,
+          text: message || caption || (imgUrl ? '[Image Attachment]' : ''),
+          imageUrl: imgUrl || null,
+          type: 'outgoing',
+          timestamp: new Date()
+        });
+      } catch (e) {}
+    }
+
+    return res.json({
+      success: true,
+      jid,
+      messageId: result.key?.id,
+      type: imgUrl ? 'image' : 'text'
+    });
   } catch (err) {
+    console.error('WhatsApp send error:', err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
