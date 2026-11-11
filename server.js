@@ -11,7 +11,8 @@ const {
   makeCacheableSignalKeyStore,
   DisconnectReason,
   Browsers,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  downloadMediaMessage
 } = require('@whiskeysockets/baileys');
 
 const PORT = process.env.PORT || 3000;
@@ -288,7 +289,7 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
       }
     });
 
-    // ================= INCOMING WHATSAPP MESSAGES =================
+    // ================= INCOMING WHATSAPP MESSAGES & MEDIA =================
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
 
@@ -302,24 +303,80 @@ async function startWhatsApp(requestedPhone = DEFAULT_PHONE) {
           await saveContact({ id: remoteJid, notify: msg.pushName });
         }
 
-        const text = msg.message.conversation ||
-                     msg.message.extendedTextMessage?.text ||
-                     msg.message.imageMessage?.caption || '';
+        // Detect images across direct, viewOnce, and ephemeral formats
+        const imgObj = msg.message.imageMessage ||
+                       msg.message.viewOnceMessage?.message?.imageMessage ||
+                       msg.message.viewOnceMessageV2?.message?.imageMessage ||
+                       msg.message.ephemeralMessage?.message?.imageMessage;
 
-        if (!text || text.trim() === '') continue;
-        const cleanText = text.trim();
-        console.log(`Message from ${remoteJid}: "${cleanText}"`);
+        const caption = imgObj?.caption ||
+                        msg.message.conversation ||
+                        msg.message.extendedTextMessage?.text || '';
+
+        let mediaBase64 = null;
+        let isImage = !!imgObj;
+
+        if (imgObj) {
+          try {
+            const buffer = await downloadMediaMessage(
+              msg,
+              'buffer',
+              {},
+              {
+                logger: pino({ level: 'silent' }),
+                reuploadRequest: sock.updateMediaMessage
+              }
+            );
+            if (buffer && buffer.length > 0) {
+              const mime = imgObj.mimetype || 'image/jpeg';
+              mediaBase64 = `data:${mime};base64,${buffer.toString('base64')}`;
+              console.log(`📸 Downloaded WhatsApp photo from ${remoteJid} (${buffer.length} bytes)`);
+            }
+          } catch (err) {
+            console.warn(`Failed to download incoming WhatsApp image (${msg.key?.id}):`, err.message);
+          }
+        }
+
+        const cleanText = caption.trim();
+        // If neither text nor media, skip
+        if (!cleanText && !mediaBase64) continue;
+
+        const displayText = cleanText || (isImage ? '[फोटो / Image]' : '');
+        console.log(`Message from ${remoteJid}: "${displayText}" ${isImage ? '(Media: YES)' : ''}`);
 
         if (db) {
           try {
-            await db.collection('whatsapp_messages').insertOne({
+            const doc = {
+              msgId: msg.key.id,
               from: remoteJid,
               senderName: msg.pushName || 'Unknown',
-              text: cleanText,
+              text: displayText,
+              caption: cleanText,
+              hasMedia: !!mediaBase64,
+              mediaType: isImage ? 'image' : null,
+              mediaBase64: mediaBase64,
               type: 'incoming',
               timestamp: new Date()
-            });
-          } catch(e){}
+            };
+            const insertRes = await db.collection('whatsapp_messages').insertOne(doc);
+
+            // Trigger background Vision AI analysis on Railway runner
+            if (mediaBase64 && insertRes.insertedId) {
+              fetch(`${RUNNER_URL}/execute`, {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${RUNNER_TOKEN}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  command: `/root/vision_venv/bin/python3 /root/vision_analyzer.py latest`,
+                  timeout: 30000
+                })
+              }).catch(e => console.warn('Async vision runner trigger error:', e.message));
+            }
+          } catch(e){
+            console.warn('Error saving incoming message to MongoDB:', e.message);
+          }
         }
 
         // ============================================================
@@ -453,6 +510,17 @@ app.all('/messages', async (req, res) => {
           ];
         }
       }
+
+      // Filter for media / photo messages if requested
+      const onlyMedia = req.query.media === 'true' || req.query.type === 'image' || req.body?.media === true;
+      if (onlyMedia) {
+        query.$or = [
+          { hasMedia: true },
+          { mediaType: 'image' },
+          { mediaBase64: { $exists: true, $ne: null } }
+        ];
+      }
+
       msgs = await db.collection('whatsapp_messages')
         .find(query)
         .sort({ timestamp: -1 })
@@ -471,6 +539,37 @@ app.all('/messages', async (req, res) => {
     count: msgs.length,
     messages: msgs
   });
+});
+
+// Serve raw image binary for any message with media
+app.get('/media/:id', async (req, res) => {
+  if (!db) return res.status(503).send('Database not connected');
+  try {
+    const id = req.params.id;
+    let query = { msgId: id };
+    try {
+      const { ObjectId } = require('mongodb');
+      if (ObjectId.isValid(id)) {
+        query = { $or: [{ _id: new ObjectId(id) }, { msgId: id }] };
+      }
+    } catch (e) {}
+
+    const msg = await db.collection('whatsapp_messages').findOne(query);
+    if (!msg || !msg.mediaBase64) {
+      return res.status(404).send('Media not found');
+    }
+    const matches = msg.mediaBase64.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
+    if (!matches || matches.length !== 3) {
+      return res.status(500).send('Invalid media format');
+    }
+    const mime = matches[1];
+    const buffer = Buffer.from(matches[2], 'base64');
+    res.setHeader('Content-Type', mime);
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    return res.end(buffer);
+  } catch (err) {
+    return res.status(500).send('Error serving media: ' + err.message);
+  }
 });
 
 // Request New Pairing Code
